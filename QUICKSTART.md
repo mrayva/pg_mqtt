@@ -1,9 +1,13 @@
 # Quick Start
 
 Assumes Boost 1.88+ (already ships `boost::mqtt5`, no vendoring needed) and
-a running MQTT broker - [NanoMQ](https://nanomq.io/) is the target for
-development/testing, already installed on this machine at
-`/usr/local/bin/nanomq`.
+a running MQTT broker - [Mosquitto](https://mosquitto.org/) is the
+recommended target as of 2026-08-22 (`apt install mosquitto`; an isolation
+test found NanoMQ's raw throughput ceiling is ~27x lower than Mosquitto's
+with the identical client - see README.md's "Broker choice" section).
+[NanoMQ](https://nanomq.io/) remains fully supported as an alternative
+(`test/manage_broker_nanomq.sh`) - nothing in this extension is
+broker-specific.
 
 ## Build And Enable
 
@@ -15,18 +19,21 @@ psql -d postgres -c 'CREATE EXTENSION pg_mqtt'
 
 ## Start A Broker
 
-For local testing, `test/manage_broker.sh` starts/stops a scratch NanoMQ
-broker on `127.0.0.1:18830` (deliberately not MQTT's default 1883, to avoid
-clashing with any real broker already running):
+For local testing, `test/manage_broker.sh` starts/stops a scratch Mosquitto
+broker with three listeners: plain on `127.0.0.1:18830`, auth-required on
+`:18832` (user `testuser`/`testpass123`), and TLS on `:18831` (deliberately
+not MQTT's default 1883, to avoid clashing with any real broker already
+running):
 
 ```bash
 test/manage_broker.sh start
 ```
 
 (`make test` does this automatically around `make installcheck` - see
-README.md's "Testing" section. NanoMQ's own start/stop control is global,
-not per-instance - only one broker can be managed this way on a machine at
-a time.)
+README.md's "Testing" section. Unlike NanoMQ, whose start/stop control is
+global to the machine, Mosquitto is a genuinely per-instance-scoped
+daemon here - each invocation gets its own scratch dir/config/PID file. To
+test against NanoMQ instead, run `test/manage_broker_nanomq.sh start`.)
 
 ## Publish
 

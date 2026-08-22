@@ -1,0 +1,26 @@
+# Scratch Mosquitto broker for pg_mqtt/mqtt_sidecar tests and verification.
+# Three listeners: plain (no auth), TLS, and plain-with-auth-required -
+# `per_listener_settings true` lets each listener have its own auth policy
+# from one broker process, unlike NanoMQ (global control, one broker at a
+# time on the whole machine). SCRATCH_DIR is substituted by manage_broker.sh.
+
+per_listener_settings true
+persistence false
+log_dest file SCRATCH_DIR/mosquitto.log
+pid_file SCRATCH_DIR/mosquitto.pid
+
+listener PLAIN_PORT 127.0.0.1
+allow_anonymous true
+protocol mqtt
+
+listener AUTH_PORT 127.0.0.1
+allow_anonymous false
+password_file SCRATCH_DIR/passwd
+protocol mqtt
+
+listener TLS_PORT 127.0.0.1
+allow_anonymous true
+protocol mqtt
+certfile SCRATCH_DIR/server_cert.pem
+keyfile SCRATCH_DIR/server_key.pem
+require_certificate false

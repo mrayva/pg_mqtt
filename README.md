@@ -9,6 +9,62 @@ SQL interface is deliberately modeled on `pgnats`'s function shape
 extensions - the implementation is unrelated (C++/PGXS/Boost.MQTT5, not
 Rust/pgrx), only the SQL-facing shape is shared.
 
+## Broker choice: Mosquitto (recommended) or NanoMQ
+
+As of 2026-08-22, **Mosquitto is the default/recommended/primarily-tested
+broker**, not NanoMQ. This follows directly from the isolation test
+documented below ("Is The ~8,200/s Single-Connection Ceiling Broker-Side Or
+Client-Side?", commit `a26b72e`): the identical, unmodified `boost::mqtt5`
+client hit **~27x** more throughput against Mosquitto than NanoMQ at N=1
+(225,873/s vs 8,223/s) - NanoMQ's low ceiling turned out to be a
+NanoMQ-specific weakness, not something inherent to MQTT or this
+extension's client library. `test/manage_broker.sh` now starts a scratch
+Mosquitto broker by default (plain/auth-required/TLS listeners on
+`18830`/`18832`/`18831`); the original NanoMQ script is preserved as
+`test/manage_broker_nanomq.sh` and remains fully supported - nothing in
+`pg_mqtt.cpp` is broker-specific (just `broker_host`/`broker_port` and the
+usual MQTT wire protocol), so switching is a config change, not a rebuild.
+
+Every connect-time feature below (auth, Last Will and Testament, TLS,
+session persistence, message expiry/user properties) was re-verified live
+against Mosquitto 2.0.22 on 2026-08-22, alongside the original NanoMQ
+verification - in two cases, Mosquitto's own logging/tooling made
+**stronger** verification possible than NanoMQ allowed:
+- **Message expiry and user properties are now fully round-tripped and
+  independently confirmed** - a plain `paho-mqtt` Python subscriber against
+  Mosquitto shows `MessageExpiryInterval : 77` and `UserProperty :
+  [('env', 'test')]` directly on the received message's properties. The
+  original NanoMQ verification could only confirm these were *accepted*
+  (publish succeeds, payload arrives) since neither `nanomq_cli` nor packet
+  capture (blocked in this sandbox) could surface incoming MQTT 5
+  properties - this gap is now closed for Mosquitto, though `mqtt_subscribe`'s
+  own receive path still discards `publish_props` entirely (unchanged, see
+  below), so this verification used a raw client, not the SQL subscribe path.
+- **Session persistence's `clean_start` flag is now directly confirmed
+  in the broker's own log** (`c0` in Mosquitto's per-connection log line -
+  `New client connected ... as sess-test-client-1 (p5, c0, k60)`), rather
+  than inferred. This confirms Boost.MQTT5's hardcoded `clean_start=false`
+  (see `mqtt_sidecar`'s notes on the same finding) actually reaches the
+  wire. `session_present` on the CONNACK still wasn't independently
+  observed - Mosquitto doesn't surface it via this log format either.
+
+**A real, unrelated bug was found and fixed while re-verifying, not
+Mosquitto-specific**: `ALTER EXTENSION pg_mqtt UPDATE` from 0.3 to 0.4 used
+bare `CREATE OR REPLACE FUNCTION` for the publish functions' new 6-arg
+signatures. Postgres treats a changed argument list as a *new* overload
+rather than a replacement of the old one - the old 4-arg versions were
+never dropped, leaving both registered simultaneously. Calling the old
+4-arg form after such an upgrade was ambiguous ("not unique"), and in the
+specific combination reproduced live, actually **segfaulted** the backend
+(`pg_detoast_datum` on a garbage `jsonb` argument 5 - the new C function
+body reading past a 4-slot `fcinfo`, confirmed via a live `gdb` backtrace).
+Fixed in `pg_mqtt--0.3--0.4.sql` by adding explicit `DROP FUNCTION IF
+EXISTS` statements for each old 4-arg overload before creating the new
+6-arg ones; verified clean on a fresh 0.3-to-0.4 upgrade in a scratch
+database (`\df` shows exactly one overload afterward). This bug affects
+**any** existing 0.3 install being upgraded to 0.4, on any broker -
+unrelated to the Mosquitto switch itself, just found while re-testing.
+
 ## Status: Phase 5 (docs) - all planned phases complete
 
 `pg_mqtt_link_check(broker_host, broker_port)` constructs a real
