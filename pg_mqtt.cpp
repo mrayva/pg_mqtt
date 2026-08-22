@@ -586,8 +586,24 @@ void mqtt_subscriber_main(Datum main_arg)
                 final_ec = ec;
                 sub_done = true;
             });
+        // Bounded poll, not a blocking ioc.run_one(): if the broker is
+        // unreachable at startup, async_subscribe's completion handler never
+        // fires and an unbounded run_one() blocks in epoll_wait forever,
+        // deaf to SIGTERM - mqtt_unsubscribe() would then report success
+        // (the signal really was delivered) while this worker lived on
+        // indefinitely. Reproduced live via gdb: Thread 1 parked in
+        // boost::asio::io_context::run_one() at this exact line, Thread 2
+        // (the resolver/connect worker) parked on a condvar wait, neither
+        // ever returning control to check ShutdownRequestPending. Mirrors
+        // the main receive loop below, which already polls this way.
         while (!sub_done) {
-            ioc.run_one();
+            if (ShutdownRequestPending) {
+                throw std::runtime_error(
+                    "shutdown requested while waiting for broker subscribe "
+                    "to complete (broker likely unreachable)");
+            }
+            CHECK_FOR_INTERRUPTS();
+            ioc.run_one_for(std::chrono::milliseconds(500));
         }
         if (final_ec) {
             throw std::runtime_error("async_subscribe failed: " + final_ec.message());

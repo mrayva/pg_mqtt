@@ -256,16 +256,31 @@ client stressing NanoMQ directly at hundreds-of-thousands-of-messages/sec
 throwaway driver in favor of exercising `pg_mqtt`'s real, shipped
 functions).
 
-**Secondary finding, also real**: `mqtt_unsubscribe()`'s `SIGTERM` did not
-cleanly terminate two workers whose broker connection was already dead
+**Secondary finding, also real - fixed**: `mqtt_unsubscribe()`'s `SIGTERM` did
+not cleanly terminate two workers whose broker connection was already dead
 (discovered when a broker was stopped without unsubscribing first) - both
 required a forced `kill -9` to clear, `mqtt_unsubscribe()` itself reported
-success (`true`) despite the worker not actually exiting. Not
-investigated further here (out of scope for this benchmark), but a real
-gap in the shutdown path worth fixing: the worker's event loop likely
-blocks inside `async_disconnect()`/`ioc.run_one()` waiting for a response
-from a broker that's no longer there, rather than timing out and exiting
-on `ShutdownRequestPending` regardless.
+success (`true`) despite the worker not actually exiting.
+
+Root-caused via a live `gdb -p <stuck_pid> -batch -ex "thread apply all bt"`
+against a worker reproduced by subscribing with *no broker running at all*
+(the most reliable repro found - a live-then-dropped connection did not
+reproduce it across 33 varied trials: idle waits, immediate unsubscribes,
+abrupt broker kills, active traffic, and a 16-concurrent-worker sweep, all
+exited cleanly). The backtrace showed Thread 1 parked in
+`boost::asio::io_context::run_one()` at `pg_mqtt.cpp:590`, inside the
+*initial* subscribe-handshake wait loop - `while (!sub_done) { ioc.run_one();
+}` - which, unlike the main receive loop just below it, never checked
+`ShutdownRequestPending` and used an unbounded `run_one()` instead of a
+bounded poll. If `async_subscribe`'s completion handler never fires (broker
+unreachable from the start), this loop blocks in `epoll_wait` forever, deaf
+to any signal. Fixed by bounding it the same way the receive loop already is
+- `ioc.run_one_for(500ms)` with a `ShutdownRequestPending` check each
+iteration, throwing (and cleanly unwinding through the existing catch/log/
+exit path) if shutdown is requested before the subscribe completes. Verified
+3/3 on the reproducing (no-broker) case, no regression on the normal
+live-broker case, and `make test`'s full `pg_regress` suite still passes
+clean.
 
 ### Two-Way Comparison: `mqtt_subscribe` vs `pgnats`'s `nats_subscribe`
 
