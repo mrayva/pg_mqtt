@@ -911,6 +911,66 @@ N=32's ~7s / 60k samples) - real signal, not a fully isolated
 `perf`-profiled N=32 run; requires `sudo -n perf record` and a
 `$HOME`-not-`/tmp` output path, per the finding above).
 
+## Follow-Up: Is The ~8,200/s Single-Connection Ceiling Broker-Side Or Client-Side?
+
+The caveat above ("not a claim that NanoMQ is slower in absolute terms in
+general... not the broker's own ceiling") was left as an open question:
+`mqtt_raw_bench.cpp`'s single-connection ceiling (~8,223/s at N=1) could be
+NanoMQ-specific, or it could be inherent to `boost::mqtt5`'s own
+architecture - one serialized `async_receive()`-then-process loop per
+connection, the same structural pattern this document's `gdb` investigation
+found bottlenecking `nanomq_cli`'s own subscriber. Swapping brokers only
+helps if the limit is the former.
+
+**Test**: same `mqtt_raw_bench.cpp` binary, zero code changes, pointed at
+**Mosquitto 2.0.22** (`apt install mosquitto`, MQTT v5.0, native shared
+subscription support since 2.0) instead of NanoMQ. Same invocation as the
+N-sweep above (`bench/topic`, 4 publisher connections, 1s duration, 16
+lanes), fresh broker restart before each N.
+
+| N | NanoMQ (known) | Mosquitto 2.0.22 |
+|---|---|---|
+| 1  | 8,223/s   | **225,873/s** |
+| 8  | 17,932/s  | **202,386/s** |
+| 32 | 22,968/s  | **134,738/s** |
+
+**Conclusion: broker-side, not client-side - and decisively so.** The
+identical, unmodified client hits **~27x** NanoMQ's throughput against
+Mosquitto at N=1. This rules out `boost::mqtt5`'s single-context
+receive-loop pattern as *the* limiting factor for absolute throughput - it
+may still be *a* cost (see the shape note below), but it's clearly not
+capping things anywhere near 8,200/s, since the same loop shape sustains
+225,873/s here. NanoMQ specifically is the weaker broker for this
+workload, not MQTT/`boost::mqtt5` in general.
+
+**A second, unplanned finding - the scaling shape inverted.** NanoMQ's
+aggregate rate *rose* with N (8,223/s -> 22,968/s, the smooth
+diminishing-returns plateau documented above). Mosquitto's *declines* with
+N instead (225,873/s -> 202,386/s -> 134,738/s, N=1 to N=32) - qualitatively
+closer to raw NATS core's peak-then-decline shape (see
+`project_blazingmq_nats_benchmark.md`) than to NanoMQ's own shape. Not
+`perf`-profiled to a root cause here (out of scope for this isolation
+test), but worth flagging plainly: **the two brokers aren't just offset by
+a constant factor, they have different scaling behavior entirely** -
+Mosquitto is far faster at low N but give some of that lead back as N
+grows, while NanoMQ is slower everywhere but comparatively more consistent
+across N. Which one "wins" at a given N depends on how many competing
+consumers you actually plan to run, not just on the N=1 number.
+
+**Caveats, stated plainly**: single test run at each N, not repeated for
+run-to-run variance the way earlier sweeps in this document were (time-
+boxed isolation test, not a full replacement investigation). N=32's
+`received` count (211,863) came in 43 messages *above* `published`
+(211,820, `loss_pct=-0.02`) - a benign counting-race artifact at the noise
+floor, not a real correctness issue, but noted rather than silently
+rounded away. EMQX was in scope as a stretch goal but not run (Mosquitto's
+result was decisive enough to answer the question this test was designed
+for). Mosquitto's own default config/tuning was used as installed, not
+tuned for maximum throughput - the ~27x gap could plausibly narrow or
+widen further under different `max_queued_messages`/persistence settings on
+either broker; this test answers "is it broker-side" cleanly, not "what's
+each broker's true ceiling under best-effort tuning."
+
 ## Maintained Documentation
 
 - [`QUICKSTART.md`](QUICKSTART.md): install, build, and first usage
