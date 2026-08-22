@@ -1174,6 +1174,31 @@ than reusing something native, which is a real, unresolved design
 question a full investigation would need to answer before any throughput
 number here can be trusted as representative.
 
+**Addendum: does Zenoh's separate `Query`/`Queryable` API (request-response,
+not pub/sub) offer a native competing-consumption primitive instead?**
+`~/multi_index`'s `iceoryx2_cache_poc` already uses this different API
+(`Query`/`Queryable`, not `Publisher`/`Subscriber`) as a working transport
+backend, which raised the question of whether multiple `Queryable`
+instances on the same key expression would load-balance queries the way
+MQTT shared subscriptions or NATS queue groups do. Tested directly (Python
+`eclipse-zenoh` 1.10.0, 4 `Queryable` instances on an identical key
+expression, 1,500 queries across 3 runs with the default target/
+consolidation): **every single query got exactly 1 reply (not a
+broadcast)**, confirmed distinct from the `target=ALL`+
+`consolidation=NONE` control (which correctly returned all 4 replies
+every time). But **the single-reply selection is consistently, heavily
+skewed, not load-balanced**: the same instance answered ~55-56% of
+queries in all 3 runs, a second ~25%, a third ~17%, and the last only
+~1.5-3% - stable and reproducible, not statistical noise. **Verdict:
+Zenoh's `Query`/`Queryable` model is a real single-reply-per-query
+routing mechanism, but it is not a viable drop-in substitute for MQTT
+shared subscriptions/NATS queue groups** - it doesn't distribute load
+evenly across instances the way real competing-consumption needs to. This
+doesn't affect `multi_index`'s existing use of `Query`/`Queryable` (a
+single-server cache-lookup pattern, where routing skew doesn't matter),
+but it closes off "just run N `Queryable` instances" as an easy path to
+competing-consumption for a future Zenoh-backed sidecar.
+
 ## Maintained Documentation
 
 - [`QUICKSTART.md`](QUICKSTART.md): install, build, and first usage
