@@ -513,6 +513,45 @@ to use sequence-numbered payloads for finer-grained diagnosis. Worth
 avoiding `-l` mode entirely until upstream fixes it; not investigated
 further here since it's off the main thread of this task.
 
+**Follow-up control: does QoS 1 fix it?** The identical scenario (5
+concurrent `nanomq_cli pub` processes, 500 messages each, one `sub`) was
+re-run at QoS 1 instead of QoS 0 - a control the original investigation
+didn't include. QoS 1 requires PUBACK handshaking and redelivery of
+unacknowledged messages, so if the earlier loss were simply QoS 0's
+documented no-guarantee/no-retry design, QoS 1 should reliably approach
+2,500/2,500. It didn't, across 4 fresh-broker runs, each given a long
+wait window afterward to let any redelivery finish (confirmed via two
+runs that plateaued and stopped growing well before the window ended,
+not cut off early):
+
+| run | received / 2,500 |
+|---|---|
+| 1 | 1,065 |
+| 2 | 2,006 |
+| 3 | 2,044 |
+| 4 | 1,065 |
+
+A real, reproducible **bimodal** split, not noise scattered around one
+value - runs 1 and 4 landed at the *exact same* count as each other and
+as the original QoS-0 result (1,064-1,067); runs 2 and 3 landed close to
+each other in a completely different band (~80% delivered). All
+publisher logs showed clean sends with zero errors in every run, same as
+before.
+
+**This overturns "QoS 0's design explains it" as a complete answer, and
+strengthens the `nanomq_cli`-receive-path conclusion rather than
+replacing it.** If QoS 0's lack of guarantees were the whole story, QoS
+1's acknowledgment+retry mechanism should have pushed every run close to
+100% delivered - it didn't, and half the runs showed no improvement over
+QoS 0 at all. A bimodal "sometimes recovers roughly half the loss via
+retry, sometimes the retry hits the identical failure and recovers
+nothing" pattern is exactly what a real, intermittent defect in
+`nanomq_cli`'s own receive path would produce - QoS 1's retransmission
+can only help if the *retried* copy of a message is actually received
+and processed correctly, and evidently it sometimes isn't either.
+(NanoMQ version installed: v0.23.7-11, checked but not otherwise
+investigated for known fixes - out of scope for this quick control.)
+
 ## Maintained Documentation
 
 - [`QUICKSTART.md`](QUICKSTART.md): install, build, and first usage
