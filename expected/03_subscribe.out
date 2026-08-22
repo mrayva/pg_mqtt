@@ -1,0 +1,123 @@
+-- Phase 3: mqtt_subscribe()/mqtt_unsubscribe(). Needs a live broker
+-- (manage_broker.sh). mqtt_subscribe() returns a real PID, not reproducible
+-- across runs, so the subscribe/publish/verify/unsubscribe sequence runs
+-- inside DO blocks: only RAISE messages we control (or silence, on success)
+-- end up in the diffed output, never the PID itself.
+--
+-- Unlike pg_blazingmq's workers, pg_mqtt's subscriber captures
+-- pg_mqtt.broker_host/broker_port from the *calling backend's* current GUC
+-- values at mqtt_subscribe() time (see pg_mqtt.cpp) - a plain session-local
+-- SET here is enough, no ALTER DATABASE needed.
+SET pg_mqtt.broker_host = 'localhost';
+SET pg_mqtt.broker_port = 18830;
+CREATE TABLE pgregress_subscribe_sink (topic_hint text, payload text, received_at timestamptz DEFAULT now());
+CREATE FUNCTION pgregress_handle_message(payload bytea) RETURNS void AS $$
+BEGIN
+  INSERT INTO pgregress_subscribe_sink (topic_hint, payload) VALUES ('live', convert_from(payload, 'UTF8'));
+END;
+$$ LANGUAGE plpgsql;
+-- Publish a *retained* message before anything subscribes, to prove
+-- retain's real semantic: a subscription established afterward still gets
+-- it immediately on connect (see README's Phase 2 note).
+SELECT mqtt_publish_text('pgregress/subscribe/topic', 'retained-hello', 1, true);
+ mqtt_publish_text 
+-------------------
+ 
+(1 row)
+
+DO $$
+DECLARE
+  wpid int;
+  i int;
+BEGIN
+  wpid := mqtt_subscribe('pgregress/subscribe/topic', 'pgregress_handle_message'::regproc, 1);
+
+  -- The retained message above should arrive without any further publish.
+  FOR i IN 1..50 LOOP
+    IF (SELECT count(*) FROM pgregress_subscribe_sink) > 0 THEN
+      EXIT;
+    END IF;
+    PERFORM pg_sleep(0.1);
+  END LOOP;
+
+  IF NOT EXISTS (SELECT 1 FROM pgregress_subscribe_sink WHERE payload = 'retained-hello') THEN
+    RAISE EXCEPTION 'retained message never arrived on a fresh subscription';
+  END IF;
+
+  -- A live publish after the subscription is established should also
+  -- arrive, same as pg_blazingmq's push-consume test.
+  PERFORM mqtt_publish_text('pgregress/subscribe/topic', 'live-hello', 1, false);
+
+  FOR i IN 1..50 LOOP
+    IF (SELECT count(*) FROM pgregress_subscribe_sink WHERE payload = 'live-hello') > 0 THEN
+      EXIT;
+    END IF;
+    PERFORM pg_sleep(0.1);
+  END LOOP;
+
+  IF NOT EXISTS (SELECT 1 FROM pgregress_subscribe_sink WHERE payload = 'live-hello') THEN
+    RAISE EXCEPTION 'push-consume: live message never arrived within timeout';
+  END IF;
+
+  IF NOT mqtt_unsubscribe(wpid) THEN
+    RAISE EXCEPTION 'mqtt_unsubscribe returned false for a worker pid we just started';
+  END IF;
+END;
+$$;
+-- The row content itself IS deterministic and worth checking directly.
+SELECT payload FROM pgregress_subscribe_sink ORDER BY payload;
+    payload     
+----------------
+ live-hello
+ retained-hello
+(2 rows)
+
+-- Negative path: an arbitrary pid must be rejected, not signaled.
+SELECT mqtt_unsubscribe(1);
+ERROR:  pid 1 is not an active pg_mqtt subscriber worker
+-- Resilience: a callback that raises must not take the worker down with it
+-- - the *next* message on the same subscription must still be processed.
+-- The WARNING itself goes to the server log (a separate bgworker process),
+-- not this session, so it isn't captured here - what's deterministic and
+-- worth checking is that processing continues afterward.
+CREATE TABLE pgregress_resilience_sink (payload text);
+CREATE FUNCTION pgregress_resilient_handler(payload bytea) RETURNS void AS $$
+DECLARE txt text;
+BEGIN
+  txt := convert_from(payload, 'UTF8');
+  IF txt = 'fail-me' THEN
+    RAISE EXCEPTION 'pgregress_resilient_handler: deliberate test failure';
+  END IF;
+  INSERT INTO pgregress_resilience_sink (payload) VALUES (txt);
+END;
+$$ LANGUAGE plpgsql;
+DO $$
+DECLARE
+  wpid int;
+  i int;
+BEGIN
+  wpid := mqtt_subscribe('pgregress/subscribe/resilience', 'pgregress_resilient_handler'::regproc, 1);
+
+  PERFORM mqtt_publish_text('pgregress/subscribe/resilience', 'fail-me', 1, false);
+  PERFORM mqtt_publish_text('pgregress/subscribe/resilience', 'ok', 1, false);
+
+  FOR i IN 1..50 LOOP
+    IF (SELECT count(*) FROM pgregress_resilience_sink) > 0 THEN
+      EXIT;
+    END IF;
+    PERFORM pg_sleep(0.1);
+  END LOOP;
+
+  IF NOT EXISTS (SELECT 1 FROM pgregress_resilience_sink WHERE payload = 'ok') THEN
+    RAISE EXCEPTION 'resilience: worker did not process a message after a prior callback failure';
+  END IF;
+
+  PERFORM mqtt_unsubscribe(wpid);
+END;
+$$;
+SELECT payload FROM pgregress_resilience_sink;
+ payload 
+---------
+ ok
+(1 row)
+

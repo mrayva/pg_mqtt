@@ -9,7 +9,7 @@ SQL interface is deliberately modeled on `pgnats`'s function shape
 extensions - the implementation is unrelated (C++/PGXS/Boost.MQTT5, not
 Rust/pgrx), only the SQL-facing shape is shared.
 
-## Status: Phase 3 (subscribe/push-consume)
+## Status: Phase 4 (tests)
 
 `pg_mqtt_link_check(broker_host, broker_port)` constructs a real
 `boost::mqtt5::mqtt_client` (without calling `async_run()`, so no live
@@ -144,6 +144,45 @@ already installed on this machine at `/usr/local/bin/nanomq` /
 `/usr/local/bin/nanomq_cli` (not running as a system service by default -
 start it manually for testing, e.g. `nanomq start`).
 
+## Testing
+
+`make test` is the one-command entry point: starts a scratch NanoMQ broker
+(`test/manage_broker.sh`, listening on `127.0.0.1:18830` - deliberately not
+MQTT's default 1883, to avoid clashing with any real broker already running
+on this machine), runs `make installcheck`, then always stops the broker
+afterward - even on failure, so a failing run doesn't leak a background
+broker process. Requires `pg_mqtt` already `make install`'d.
+
+NanoMQ's own start/stop control turned out to be **global**, not
+per-instance (a single PID file at `/tmp/nanomq/nanomq.pid` and a fixed
+control IPC socket at `/tmp/nanomq_cmd.ipc`, confirmed by observation, not
+documented anywhere obvious) - only one NanoMQ instance can be managed this
+way on a given machine at a time. Fine for this test suite (one scratch
+broker), but don't assume two independent test brokers can run side by side
+with `manage_broker.sh`.
+
+`REGRESS = 01_link_check 02_publish 03_subscribe` covers all three phases.
+`03_subscribe.sql` also verifies two things worth knowing about if you're
+reading or extending it:
+
+- **Retain semantics for real**: publishes a retained message *before* any
+  subscriber exists, then subscribes, and checks it arrives immediately -
+  not just trusting the Phase 2 claim, actually exercising it.
+- **Resilience**: publishes a message that makes the callback raise, then a
+  normal message on the same subscription, and checks the *second* one
+  still gets processed - proving a callback failure doesn't take the whole
+  worker down. The `WARNING` itself goes to the server log (a separate
+  bgworker process, not the test's own session), so it isn't part of the
+  diffed output - what's checked is that processing continues afterward,
+  which is the actually load-bearing guarantee.
+
+Like `pg_blazingmq`'s `bmq_subscribe`, a test that fails *inside* a
+`mqtt_subscribe`/`mqtt_unsubscribe` `DO` block before reaching
+`mqtt_unsubscribe()` can leave a subscriber worker running, holding a
+database connection open. Recover with `SELECT pg_terminate_backend(pid)
+FROM pg_stat_activity WHERE backend_type = 'pg_mqtt subscriber';` before
+retrying.
+
 ## Plan
 
 Mirroring `pg_blazingmq`'s own phased build:
@@ -156,7 +195,8 @@ Mirroring `pg_blazingmq`'s own phased build:
    and `pg_blazingmq`'s `bmq_subscribe` background-worker precedent. See
    the ack-semantics limitation noted above - genuinely different from
    BlazingMQ's push-consume, not just a naming difference.
-4. **Tests** - `pg_regress` suite against a real NanoMQ broker.
+4. **Tests** (done) - `pg_regress` suite against a real NanoMQ broker,
+   `make test` as the one-command entry point (see Testing above).
 5. **Docs**.
 
 Deliberately out of scope: `pgnats`'s NATS KV (`nats_get/put_*`) and object

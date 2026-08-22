@@ -12,6 +12,8 @@ EXTENSION = pg_mqtt
 DATA = pg_mqtt--0.1.sql pg_mqtt--0.2.sql pg_mqtt--0.3.sql \
        pg_mqtt--0.1--0.2.sql pg_mqtt--0.2--0.3.sql
 
+REGRESS = 01_link_check 02_publish 03_subscribe
+
 PG_CPPFLAGS = -std=c++17 -fPIC
 # Modern Boost.System (1.69+) is header-only by default - no libboost_system
 # to link against on this system (confirmed: -lboost_system fails to find
@@ -32,3 +34,15 @@ override CFLAGS :=
 
 %.o: %.cpp
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -c -o $@ $<
+
+# `make installcheck` (PGXS's own target, above) assumes a broker is already
+# running on 127.0.0.1:18830 and pg_mqtt is already `make install`'d. `make
+# test` is the one-command version: starts a scratch broker, runs
+# installcheck, always stops the broker after - even if installcheck fails,
+# so a failing test run doesn't leak a background broker process.
+.PHONY: test
+test:
+	test/manage_broker.sh start
+	$(MAKE) installcheck; status=$$?; \
+	test/manage_broker.sh stop; \
+	exit $$status

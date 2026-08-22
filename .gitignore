@@ -6,3 +6,4 @@ results/
 regression.diffs
 regression.out
 log/
+test/.broker_scratch/
