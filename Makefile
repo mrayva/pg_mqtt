@@ -9,8 +9,8 @@ MODULE_big = pg_mqtt
 OBJS = pg_mqtt.o
 
 EXTENSION = pg_mqtt
-DATA = pg_mqtt--0.1.sql pg_mqtt--0.2.sql pg_mqtt--0.3.sql \
-       pg_mqtt--0.1--0.2.sql pg_mqtt--0.2--0.3.sql
+DATA = pg_mqtt--0.1.sql pg_mqtt--0.2.sql pg_mqtt--0.3.sql pg_mqtt--0.4.sql \
+       pg_mqtt--0.1--0.2.sql pg_mqtt--0.2--0.3.sql pg_mqtt--0.3--0.4.sql
 
 REGRESS = 01_link_check 02_publish 03_subscribe
 
@@ -18,7 +18,7 @@ PG_CPPFLAGS = -std=c++17 -fPIC
 # Modern Boost.System (1.69+) is header-only by default - no libboost_system
 # to link against on this system (confirmed: -lboost_system fails to find
 # the library at all).
-SHLIB_LINK = -lstdc++ -lpthread
+SHLIB_LINK = -lstdc++ -lpthread -lssl -lcrypto
 
 # Use C++ compiler
 CC = g++
