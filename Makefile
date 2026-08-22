@@ -9,7 +9,8 @@ MODULE_big = pg_mqtt
 OBJS = pg_mqtt.o
 
 EXTENSION = pg_mqtt
-DATA = pg_mqtt--0.1.sql pg_mqtt--0.2.sql pg_mqtt--0.1--0.2.sql
+DATA = pg_mqtt--0.1.sql pg_mqtt--0.2.sql pg_mqtt--0.3.sql \
+       pg_mqtt--0.1--0.2.sql pg_mqtt--0.2--0.3.sql
 
 PG_CPPFLAGS = -std=c++17 -fPIC
 # Modern Boost.System (1.69+) is header-only by default - no libboost_system

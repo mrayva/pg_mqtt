@@ -9,7 +9,7 @@ SQL interface is deliberately modeled on `pgnats`'s function shape
 extensions - the implementation is unrelated (C++/PGXS/Boost.MQTT5, not
 Rust/pgrx), only the SQL-facing shape is shared.
 
-## Status: Phase 2 (publish path)
+## Status: Phase 3 (subscribe/push-consume)
 
 `pg_mqtt_link_check(broker_host, broker_port)` constructs a real
 `boost::mqtt5::mqtt_client` (without calling `async_run()`, so no live
@@ -62,6 +62,67 @@ background thread) resolves it. QoS is a *compile-time* template
 parameter on Boost.MQTT5's `async_publish<qos_e>` - the runtime `qos int`
 from SQL dispatches to one of three template instantiations at each call.
 
+`mqtt_subscribe(topic, callback_fn, qos DEFAULT 0)` registers a dedicated
+background worker that stays subscribed to `topic` indefinitely, calling
+`callback_fn(payload bytea)` for every message received. Returns the
+worker's PID, which doubles as the subscription handle for
+`mqtt_unsubscribe(worker_pid)`. Mirrors `pg_blazingmq`'s `bmq_subscribe`
+architecture directly: a DSM segment hands off one-shot config to a freshly
+registered dynamic background worker, an atomic readiness flag closes the
+race between "worker process started" and "worker's subscription is
+actually open" (bounded 5s wait, best-effort), and the worker's PID doubles
+as the subscription handle via `pg_stat_activity.backend_type` -
+`mqtt_unsubscribe()` validates a PID against this before signaling it, so
+it can't be used to kill arbitrary processes.
+
+```sql
+CREATE TABLE received_messages (topic_hint text, payload text, received_at timestamptz DEFAULT now());
+
+CREATE FUNCTION handle_message(payload bytea) RETURNS void AS $$
+BEGIN
+  INSERT INTO received_messages (topic_hint, payload) VALUES ('sensors', convert_from(payload, 'UTF8'));
+END;
+$$ LANGUAGE plpgsql;
+
+SET pg_mqtt.broker_host = 'localhost';
+SET pg_mqtt.broker_port = 1883;
+SELECT mqtt_subscribe('sensors/+/temp', 'handle_message'::regproc, 1) AS worker_pid;
+--  worker_pid
+-- ------------
+--      901816
+
+-- ... messages arrive asynchronously, with no further action from this session ...
+
+SELECT mqtt_unsubscribe(901816);  -- stops the worker cleanly
+```
+
+**Important, honest limitation vs `pg_blazingmq`'s `bmq_subscribe`**: this is
+*not* true at-least-once delivery. Boost.MQTT5's client library handles
+MQTT's PUBACK/PUBREC/PUBREL/PUBCOMP acknowledgment internally, with no way
+to defer or control it from application code (confirmed by reading the
+whole `boost/mqtt5` header tree - there is no manual-ack API anywhere). So
+the broker considers a message delivered, and won't redeliver it,
+regardless of whether `callback_fn` ever runs or succeeds. A failed
+callback's transaction is rolled back and a `WARNING` is logged, but the
+message itself is gone either way - MQTT's QoS here guarantees delivery to
+the *client*, not to a *successfully-completed callback*, unlike
+BlazingMQ's real at-least-once push-consume.
+
+A real bug surfaced and fixed while verifying the failure path (not just
+the happy path): building the `WARNING` message directly from
+`edata->message` (the `CopyErrorData()`'d error text) *after*
+`FlushErrorState()`/`AbortCurrentTransaction()` had already run corrupted
+the heap (`pfree` on an invalid pointer, with the freed chunk's header
+overwritten by fragments of that same message text) - reproduced
+consistently, confirmed via a diagnostic build with a static message that
+didn't crash. Fixed by copying `edata->message` into an independent
+`std::string` immediately after `CopyErrorData()`, before anything else
+runs - `CopyErrorData()`'s documented independence from `FlushErrorState()`
+did not, in practice, extend far enough to survive
+`AbortCurrentTransaction()` here. Verified fixed across repeated
+consecutive callback failures, worker staying alive and processing
+correctly throughout.
+
 ## Building
 
 Requires Boost 1.88+ (system package `libboost-dev` on this machine already
@@ -90,9 +151,11 @@ Mirroring `pg_blazingmq`'s own phased build:
 1. **Build/link line** (done) - proof-of-linkage against Boost.MQTT5.
 2. **Publish path** (done) - `mqtt_publish_binary`/`text`/`json`/
    `jsonb(topic, payload, qos DEFAULT 0, retain DEFAULT false)`.
-3. **Subscribe/push-consume** - `mqtt_subscribe(topic, fn_oid, qos DEFAULT
-   0)` / `mqtt_unsubscribe`, mirroring `pgnats`'s `nats_subscribe` and
-   `pg_blazingmq`'s `bmq_subscribe` background-worker precedent.
+3. **Subscribe/push-consume** (done) - `mqtt_subscribe(topic, fn_oid, qos
+   DEFAULT 0)` / `mqtt_unsubscribe`, mirroring `pgnats`'s `nats_subscribe`
+   and `pg_blazingmq`'s `bmq_subscribe` background-worker precedent. See
+   the ack-semantics limitation noted above - genuinely different from
+   BlazingMQ's push-consume, not just a naming difference.
 4. **Tests** - `pg_regress` suite against a real NanoMQ broker.
 5. **Docs**.
 
