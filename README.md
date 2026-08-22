@@ -9,7 +9,7 @@ SQL interface is deliberately modeled on `pgnats`'s function shape
 extensions - the implementation is unrelated (C++/PGXS/Boost.MQTT5, not
 Rust/pgrx), only the SQL-facing shape is shared.
 
-## Status: Phase 4 (tests)
+## Status: Phase 5 (docs) - all planned phases complete
 
 `pg_mqtt_link_check(broker_host, broker_port)` constructs a real
 `boost::mqtt5::mqtt_client` (without calling `async_run()`, so no live
@@ -197,7 +197,39 @@ Mirroring `pg_blazingmq`'s own phased build:
    BlazingMQ's push-consume, not just a naming difference.
 4. **Tests** (done) - `pg_regress` suite against a real NanoMQ broker,
    `make test` as the one-command entry point (see Testing above).
-5. **Docs**.
+5. **Docs** (done) - see Changelog and Maintained Documentation below.
+
+All originally-planned phases are complete.
+
+## Changelog
+
+Each entry corresponds to one `pg_mqtt--X.Y.sql` version; see those files
+for the exact functions each version added. This extension hasn't reached
+1.0 yet - versions below that should be considered unstable.
+
+- **0.3** -- Added push-consume: `mqtt_subscribe(topic, callback_fn, qos
+  DEFAULT 0)` / `mqtt_unsubscribe(worker_pid)`. A dynamic background worker
+  per subscription, config handed off via a pinned DSM segment, an atomic
+  readiness handshake, and per-message SPI transaction dispatch - see the
+  honest note above and in ARCHITECTURE.md about why this is *not* true
+  at-least-once the way `pg_blazingmq`'s `bmq_subscribe` is.
+- **0.2** -- Added `mqtt_publish_binary/text/json/jsonb(topic, payload, qos
+  DEFAULT 0, retain DEFAULT false)`: a per-backend client with a background
+  `io_context`-pumping thread and a synchronous promise/future bridge for
+  publish calls, plus runtime dispatch across QoS's three compile-time
+  template instantiations.
+- **0.1** -- Initial release: `pg_mqtt_link_check(broker_host, broker_port)`,
+  proof-of-linkage against Boost.MQTT5.
+
+(Phase 4's test suite added no new SQL surface, so it didn't bump the
+version.)
+
+## Maintained Documentation
+
+- [`QUICKSTART.md`](QUICKSTART.md): install, build, and first usage
+- [`ARCHITECTURE.md`](ARCHITECTURE.md): the sync/async publish bridge,
+  QoS's compile-time-template quirk, the DSM/background-worker design
+  behind push-consume, and the honest acknowledgment-semantics limitation
 
 Deliberately out of scope: `pgnats`'s NATS KV (`nats_get/put_*`) and object
 store (`nats_get/put_file`) functions have no MQTT equivalent - MQTT's
