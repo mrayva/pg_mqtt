@@ -267,6 +267,64 @@ blocks inside `async_disconnect()`/`ioc.run_one()` waiting for a response
 from a broker that's no longer there, rather than timing out and exiting
 on `ShutdownRequestPending` regardless.
 
+### Two-Way Comparison: `mqtt_subscribe` vs `pgnats`'s `nats_subscribe`
+
+The N=1 result above (~650-661/s, transaction-bound) raised an obvious
+question: is that `pg_mqtt`-specific overhead, or is it just what one
+Postgres transaction per callback costs on this machine regardless of
+extension? Checked directly against `pgnats`'s own push-consume path
+(`nats_subscribe`), not assumed either way.
+
+**`nats_subscribe`'s transaction model, confirmed from `pgnats`'s real
+source** (`~/pgnats/src/bgw/subscriber/mod.rs`, `pg_api.rs`) - structurally
+the same shape as `pg_mqtt`/`pg_blazingmq`: `handle_internal_message()`'s
+`CallbackCall` case wraps every dispatch in `BackgroundWorker::transaction(||
+call_function(callback, data))` - `pgrx`'s own equivalent of
+`StartTransactionCommand`/`SPI_connect`/.../`CommitTransactionCommand`, one
+full transaction per message, not batched or pipelined. One real
+architectural difference worth noting: `call_function` runs `SELECT
+{callback}($1)` as a genuine SQL string through `Spi::connect_mut` (full
+parse + plan + execute), where `pg_mqtt`/`pg_blazingmq` call
+`OidFunctionCall1` directly against an already-resolved OID, bypassing the
+SQL layer entirely - a plausible source of *extra* per-message cost for
+`nats_subscribe`, not less.
+
+**A real, unrelated operational issue surfaced before any number could be
+trusted**: `nats_subscribe()`'s first attempt silently failed - `pgnats`
+uses a launcher/per-database-subscriber-worker architecture, and this
+database's subscriber worker had permanently exited hours earlier
+(`IO error: Connection refused`, from a NATS server that wasn't running yet
+at Postgres startup) with no automatic retry. `pg_stat_activity` still
+showed the launcher running, but `SELECT * FROM pgnats.subscriptions`
+was empty and the log read `No subscriber worker found for db_oid 5`. Fixed
+with a full `postgresql` service restart (not a `pgnats` code/config
+change) to let the launcher re-spawn a live subscriber worker - worth
+knowing this can happen silently if NATS isn't already up when Postgres
+starts.
+
+**Result, reproduced twice with a fresh `nats-server` restart between runs**
+(20,000 messages, `nats_publish_binary`, same minimal one-row-insert
+callback shape as the `pg_mqtt` test, N=1, core NATS - no JetStream):
+
+| system | N | drain rate |
+|---|---|---|
+| `pg_mqtt` (`mqtt_subscribe`, NanoMQ) | 1 | 661/s |
+| `pgnats` (`nats_subscribe`, NATS core), run 1 | 1 | 600/s |
+| `pgnats` (`nats_subscribe`, NATS core), run 2 | 1 | 611/s |
+
+**Within ~10% of each other, both reproducible.** This confirms the
+hypothesis directly: the ~600-660/s ceiling is Postgres's own
+per-message-transaction cost, not something specific to `pg_mqtt`'s
+implementation or NanoMQ - `pgnats`, a mature, independently-implemented
+extension with a different background-worker architecture (one shared
+subscriber-dispatch worker per *database*, not per *subscription* the way
+`pg_mqtt`/`pg_blazingmq` spin up a worker per `..._subscribe()` call - so
+N>1 numbers between the two aren't directly comparable without separate
+databases per `pgnats` subscription; only N=1 isolates the same question
+cleanly) lands in the same place. Neither extension's push-consume design
+is unusually slow; one Postgres transaction per message just costs what it
+costs.
+
 ## Plan
 
 Mirroring `pg_blazingmq`'s own phased build:
