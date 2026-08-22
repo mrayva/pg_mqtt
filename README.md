@@ -612,6 +612,87 @@ concrete loss point: `nanomq_cli`'s own receive-side parsing/dispatch
 demonstrably drops fully-received wire data under concurrent-publisher
 burst load.
 
+### Follow-up: source-level evidence via `gdb` against a debug build
+
+`strace` proved loss occurs above the syscall layer but couldn't say
+exactly where. To pin that down, NanoMQ was built from source
+(`github.com/nanomq/nanomq`, with its `nng`/NanoNNG submodule) with
+`-DCMAKE_BUILD_TYPE=RelWithDebInfo -DBUILD_NANOMQ_CLI=ON`, giving
+unstripped `nanomq`/`nanomq_cli` binaries with real debug symbols -
+unlike the system-installed, stripped versions used everywhere above.
+`gdb -x <script.py>` (batch, non-interactive, counting breakpoint hits
+rather than manual stepping) instrumented the two layers between "bytes
+off the wire" and "message printed": NNG's MQTT protocol dispatch
+(`nng/src/mqtt/protocol/mqtt/mqtt_client.c`, the `case NNG_MQTT_PUBLISH:`
+handler) and `nanomq_cli`'s own app-level state machine
+(`nanomq_cli/client.c`'s `client_cb`, `RECV_WAIT` state).
+
+Reproducing the same 5-publisher/500-message/QoS-0 scenario under this
+instrumented `sub` process (2,500 sent) gave a clean, reproducible split:
+
+| checkpoint | count | location |
+|---|---|---|
+| decoded as PUBLISH by NNG's protocol layer | 2,500 / 2,500 | `mqtt_client.c:1205`, `case NNG_MQTT_PUBLISH` |
+| delivered into the CLI's own app state machine | 754 / 2,500 | `client.c:1521`, `RECV_WAIT` entry |
+| printed by the subscriber's callback | 753 / 2,500 | `client.c:1531`, `console(...)` |
+
+**Every single published message was correctly decoded by NNG's MQTT
+parser** (2,500/2,500) - this rules out wire-level/transport-decode loss
+as the mechanism, at least in this run. The real gap (2,500 to 754, ~70%)
+opens up entirely between protocol-level decode and the point where
+`nanomq_cli`'s single-threaded `client_cb` state machine actually consumes
+a message via `nng_ctx_recv()`. That handoff goes through a bounded,
+fixed-size 64-slot queue (`NNG_MAX_RECV_LMQ` = 64,
+`nng/include/nng/mqtt/mqtt_client.h:166`) - when no `ctx` is currently
+waiting in `recv_queue` (i.e. the app hasn't re-armed `nng_ctx_recv()`
+yet), an arriving PUBLISH is enqueued there instead of delivered directly
+(`mqtt_client.c:1216-1225`), and if that queue is already full, the
+message is freed and dropped on the spot.
+
+**One important negative result**: that drop path unconditionally calls
+`log_warn("Warning: no ctx found!! PUB msg lost!")` - confirmed present
+in the built binary (`strings` finds the exact text) - yet this line
+**never appeared once** in any `gdb` run's output, despite a ~1,750-message
+gap. That means the dominant loss mechanism here is not cleanly
+attributable to that one guarded overflow-drop branch specifically; it's
+more directly explained by `nanomq_cli sub`'s single serialized
+`nng_ctx_recv`-then-process loop (`--parallel`/`-n` defaults to 1 `ctx`)
+simply not keeping pace with a concurrent 5-process burst - some fraction
+of the un-delivered messages may have still been sitting queued
+(undropped, just undrained) when the test was cut off, rather than
+actively dropped; this run's methodology can't fully separate the two.
+
+**gdb's own overhead measurably worsened the loss** - 30% delivered here
+vs. 44-84% across the non-gdb `strace` runs above - which is itself
+informative: it's a dose-response result consistent with "the app-side
+receive loop being too slow to keep up with a concurrent-publisher burst"
+as the dominant mechanism, since deliberately slowing that loop further
+(via breakpoint overhead, with no code changes) made the loss worse in
+direct proportion, rather than being independent of it.
+
+**One dead end worth recording**: an attempt to use a *conditional*
+breakpoint (`client.c:1531 if topic_len == 0`) to check whether messages
+reaching `RECV_WAIT` had a corrupted/empty topic produced a self-
+contradicting result - it reported `topic_len == 0` on all 754 hits, yet
+753 of those same messages were simultaneously printed correctly with
+real topic/payload text in the same run. This is consistent with a known
+GDB pitfall: at `-O2`/`RelWithDebInfo`, a local variable's DWARF-described
+location isn't always valid yet at the exact PC a source-line breakpoint
+lands on, so a condition referencing it can read stale/garbage state.
+Not a real finding about `nanomq_cli` - flagged so the technique isn't
+mistakenly reused as-is.
+
+**Conclusion**: the dominant, now source-level-confirmed loss point is the
+handoff between NNG's protocol-decode layer and `nanomq_cli`'s single-
+context application receive loop under concurrent-publisher burst load -
+not broker-side, not wire-level decode. The precise final attribution
+(silent drop via an unlogged path vs. simply not-yet-drained backlog at
+kill time) remains open and would need either a longer, uninstrumented
+observation window with careful drain-to-plateau confirmation, or
+instrumenting `nni_lmq_put`'s actual queue-depth over time rather than
+just its call sites. Reported honestly as the strongest evidence gathered
+so far, not a fully closed case.
+
 ## Maintained Documentation
 
 - [`QUICKSTART.md`](QUICKSTART.md): install, build, and first usage
