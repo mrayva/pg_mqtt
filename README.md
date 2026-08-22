@@ -47,6 +47,86 @@ SELECT mqtt_publish_text('sensors/room1/temp', '21.5', 1, false);
 SELECT mqtt_publish_jsonb('sensors/room1/status', '{"online": true}'::jsonb, 1, true);
 ```
 
+## Connect-time features: auth, Last Will and Testament, session persistence, TLS
+
+Boost.MQTT5 exposes several standard MQTT features that weren't wired in
+through 0.3 - all closed out in 0.4, each verified live against a real
+NanoMQ broker rather than just compiled:
+
+| GUC | Purpose |
+|---|---|
+| `pg_mqtt.client_id` | MQTT Client Identifier. Empty (default) lets the broker assign one, which changes every reconnect. **Set this to a stable value if you use `session_expiry_seconds`** - session resumption is keyed by Client ID. |
+| `pg_mqtt.broker_username` / `pg_mqtt.broker_password` | Username/password authentication. Empty username = no credentials sent (unchanged default behavior). `broker_password` is `PGC_SUSET`/superuser-only, matching how a credential-shaped GUC should be scoped. |
+| `pg_mqtt.will_topic` / `will_payload` / `will_qos` / `will_retain` | Last Will and Testament - the broker publishes this if the connection closes abnormally. Empty `will_topic` (default) = no Will configured. **Verified end-to-end**: `SIGKILL`-ing a backend with a Will configured caused the broker to publish it to a separate live subscriber, byte-for-byte. |
+| `pg_mqtt.session_expiry_seconds` | MQTT 5 Session Expiry Interval sent at CONNECT (0 = no hint, default). Boost.MQTT5 exposes no separate Clean Start flag - this is the only session-persistence knob this client library offers. **Verified the CONNECT-time property is sent and accepted without error across a disconnect/reconnect with a stable `client_id`; did not independently confirm the broker's CONNACK reported `session_present=true`** - NanoMQ doesn't log that at default verbosity, and packet capture is blocked in this sandbox (see the NanoMQ investigation earlier in this document). Treat as wired-and-accepted, not as a fully proven resumption guarantee. |
+| `pg_mqtt.tls_enabled` | Connect over TLS instead of plain TCP. |
+| `pg_mqtt.tls_ca_file` | CA file to verify the broker's certificate against. Empty = system default trust store. **Verified both directions**: connecting with the right CA succeeded; connecting to the same TLS listener with *no* CA configured (falling back to the system store, which doesn't trust a throwaway self-signed cert) was genuinely rejected - the broker's own log showed a real `Cryptographic error` on the handshake, not a client-side no-op. |
+| `pg_mqtt.tls_cert_file` / `tls_key_file` | Client certificate/key for mutual TLS. Wired but not independently verified against a broker actually requiring client certs (NanoMQ's `fail_if_no_peer_cert` mode). |
+
+A TLS-capable client is a structurally different Boost.MQTT5 type
+(`mqtt_client<StreamType, TlsContext>`, not just a flag), so `pg_mqtt`
+picks between a plain and a TLS client once per backend, the first time a
+connection is actually needed - like `broker_host`/`broker_port` before it,
+`pg_mqtt.tls_enabled` (and every GUC in this section) only takes effect at
+that point, not on a later `SET`. Two library gaps had to be filled
+directly in `pg_mqtt.cpp` to get TLS working at all: Boost.MQTT5 declares
+`tls_handshake_type<StreamType>` and `assign_tls_sni<TlsContext,
+TlsStream>` as customization points for the caller to specialize per
+stream type, but ships no specialization for plain `boost::asio::ssl`
+streams - omitting them isn't a compile error, it's a *link* error
+(`undefined symbol`) that only appears once a TLS-capable client is
+actually instantiated.
+
+`mqtt_subscribe()`'s worker picks up the same connect-time GUCs, copied
+into its `SubscriberConfig` at call time (a background worker doesn't
+inherit its launching session's `SET`-level overrides - the same reason
+`broker_host`/`broker_port` were already threaded through, before any of
+this existed). One real MQTT-specific wrinkle: if `pg_mqtt.client_id` is
+set, the worker doesn't use it verbatim - MQTT brokers apply *takeover*
+semantics on a duplicate Client ID (the older connection gets
+disconnected), so a subscriber sharing the backend's exact Client ID would
+fight with the publish connection (or another subscriber) for one
+identity. The worker uses `"<client_id>-sub-<topic>"` instead, which is
+enough to be stable across a worker restart on the same topic (preserving
+session persistence's actual point) but **does not** resolve two
+concurrent `mqtt_subscribe()` calls on the *same* topic - those still
+collide today.
+
+`mqtt_publish_binary/text/json/jsonb` gained two new trailing parameters:
+`message_expiry_seconds DEFAULT NULL` (MQTT 5 Message Expiry Interval -
+the broker discards the message if undelivered within this many seconds)
+and `user_properties DEFAULT NULL` (a flat `jsonb` object of string keys to
+string values, mapped onto MQTT 5 User Properties - any non-object
+top-level value, or any non-string value, is a hard error rather than a
+silent best-effort coercion). Both were verified to be *accepted*
+end-to-end (publish succeeds, payload arrives correctly at a live
+subscriber) but their on-wire property bytes were not independently
+inspected - `nanomq_cli sub -V 5 -v`'s own verbose output doesn't surface
+incoming MQTT 5 properties, and, again, packet capture is unavailable in
+this sandbox. **Also worth noting**: `mqtt_subscribe()`'s receive path
+still discards incoming `publish_props` entirely (unchanged from 0.3) - a
+subscribed callback has no way to read a message's own expiry/User
+Properties even though the publish side can now set them for other
+consumers. Extending the subscribe path to expose them is a natural,
+still-open follow-up.
+
+**A real, previously-latent bug found and fixed while verifying auth**:
+`publish_sync_on()`'s wait for a publish's completion was a raw,
+unbounded `std::future::get()` - harmless as long as every connection
+attempt eventually either succeeded or handed back an error, which held
+until this version made "the broker never accepts the connection at all"
+a reachable outcome (wrong credentials, TLS handshake rejected - Boost.MQTT5
+just retries forever in both cases rather than surfacing a terminal error).
+A backend stuck this way didn't even respond to `pg_terminate_backend()`'s
+`SIGTERM` - only `SIGKILL` worked, reproduced live during this pass.
+Fixed by polling the future with a bounded `wait_for()` and calling
+`CHECK_FOR_INTERRUPTS()` between polls (mirroring the bounded-wait pattern
+`mqtt_subscribe`'s own hang fix already used, commit `82920af`), with the
+promise itself moved to a `shared_ptr` so a still-pending completion
+handler on the background thread can't write into a promise whose stack
+frame already unwound. Verified: `pg_terminate_backend()` against a stuck
+auth-failure connection now takes effect in ~1-2 seconds, not never.
+
 One session (`boost::mqtt5::mqtt_client`) per backend, lazily started on
 first use and torn down via `on_proc_exit` - same shape as
 `pg_blazingmq.cpp`'s `get_session()`. Unlike BlazingMQ's `bmqa::Session`,
