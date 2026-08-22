@@ -1118,6 +1118,62 @@ daemon or non-default port (19001/19021/19031/19041) was left running.
 Nothing about NanoMQ's or Mosquitto's existing system installs/config was
 touched by this survey.
 
+### Zenoh cheap validation (not an MQTT broker - a different protocol entirely)
+
+A quick, deliberately small validation, not a full investigation: is
+[Zenoh](https://zenoh.io) (Rust, Eclipse Foundation) - which an academic
+paper (Paul et al. 2026, arXiv:2603.21600) reported hitting 850K msg/s in
+a 10,000-subscriber fanout test - actually fast under a pattern closer to
+this ecosystem's own usage? Ran a throwaway Python harness
+(`bench/zenoh_validation/`, `eclipse-zenoh` pip package v1.10.0, a local
+`zenohd` v1.10.0 router on TCP 17447) with the same drain-until-stable
+discipline used throughout this document (poll until the receive count is
+stable for 3 consecutive checks, not a fixed sleep) and explicit
+`reliability=RELIABLE, congestion_control=BLOCK` on the publisher after an
+initial best-effort run silently dropped ~39% of 500,000 messages at this
+burst rate (confirming Zenoh's *default* pub/sub, like MQTT QoS 0, is
+lossy under enough back-pressure - not a bug, just not comparable to this
+document's 0%-loss MQTT numbers without asking for reliability
+explicitly).
+
+**Important caveat, not glossed over**: Zenoh's plain pub/sub is pure
+**fan-out** (every subscriber gets every message), confirmed by inspecting
+the Python API directly (`Publisher`/`Subscriber` only; `Queryable`/
+`Querier` are request-reply, not a pub/sub message-splitting primitive) -
+Zenoh has **no built-in equivalent to MQTT shared subscriptions or NATS
+queue groups**. So "N=8" below means 8 independent subscribers each
+receiving the *full* stream, not 8 subscribers splitting one stream the
+way every other N-sweep in this document measures. These numbers are not
+directly comparable to the broker survey table above without accounting
+for that difference.
+
+| N | pattern | per-subscriber rate | loss |
+|---|---|---|---|
+| 1 | fan-out | **1,462,413/s** | 0% (RELIABLE) |
+| 8 | fan-out, ×8 | **~526,000/s each** | 0% (RELIABLE) |
+
+Both numbers are real and reliable (0% loss, verified), and both are far
+above every MQTT broker measured in this document (Mosquitto's own
+best number was 225,873/s at N=1). This is a genuinely different protocol
+with a genuinely higher throughput ceiling in this quick test - but it
+answers a different question than the MQTT survey above (fan-out
+capacity, not competing-consumer capacity), was run once each (not
+repeated for variance, unlike the more rigorous numbers elsewhere in this
+document), and via Python bindings rather than the C/C++ path this
+ecosystem would actually need for a real integration.
+
+**Honest read**: worth a real follow-up investigation if fan-out-shaped
+throughput ever matters here, but building a `pg_zenoh`/`zenoh_sidecar`
+extension pair is a large undertaking (new client library integration,
+no drop-in `broker_host`/`broker_port` swap the way Mosquitto was) and
+this validation alone doesn't establish whether Zenoh could support this
+ecosystem's actual *competing-consumer* push-consume pattern at all -
+that would need to be built on top of Zenoh's primitives (e.g.
+liveliness tokens or an application-level partitioning scheme) rather
+than reusing something native, which is a real, unresolved design
+question a full investigation would need to answer before any throughput
+number here can be trusted as representative.
+
 ## Maintained Documentation
 
 - [`QUICKSTART.md`](QUICKSTART.md): install, build, and first usage
