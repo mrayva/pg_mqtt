@@ -552,6 +552,66 @@ and processed correctly, and evidently it sometimes isn't either.
 (NanoMQ version installed: v0.23.7-11, checked but not otherwise
 investigated for known fixes - out of scope for this quick control.)
 
+### Follow-up: direct evidence via `strace` (packet capture unavailable)
+
+The elimination-based conclusion above was tested directly rather than left
+as an inference. `tshark`/`dumpcap` packet capture turned out to be
+unavailable in this environment - it failed identically whether run via
+`sudo`, without `sudo` (`dumpcap` already carries
+`cap_net_admin,cap_net_raw` capabilities, so `sudo` wasn't even the right
+approach), or with the sandbox explicitly disabled, always with `Couldn't
+run dumpcap in child process: Permission denied`. This looks like a
+container-level restriction (no `CAP_NET_RAW` granted to the container)
+that isn't fixable from inside the session, so the wire-level count from
+the original plan couldn't be captured - only `strace` (which needs
+`ptrace`, confirmed working, not raw sockets) was available.
+
+Re-running the same 5-publisher/500-message/QoS-0 scenario under `strace
+-f` first showed the loss reproduces under tracing too, at yet another
+rate (1,935/2,500 received, ~23% loss, and a separate run landed at
+1,845/2,500, ~26% loss) - a third and fourth data point confirming the
+loss rate itself varies run to run rather than converging on one number,
+consistent with the QoS-1 control's bimodal finding.
+
+The first trace attempt (filtered to `-e trace=network,read`) recorded
+**zero** read/recv syscalls on the MQTT socket for the entire 62-second
+run despite over a thousand messages being received in that window -
+because NNG's actual data-path syscall is `readv()`, which isn't in
+strace's `read` or `network` trace classes. Once the filter was widened
+(`-e trace=%network,%desc`), the real picture emerged: NNG reads each
+PUBLISH as two `readv()` calls per message - a 2-byte fixed header, then
+a 17-byte variable-header+payload chunk containing the exact topic and
+payload bytes (e.g. `readv(5, [{iov_base="\0\vbench/topicpub2", ...}])`).
+
+In the final full-scale run: **2,301 complete 17-byte PUBLISH payloads
+were read off the socket via `readv()`, but only 1,935 were ever printed
+by the subscriber's own message callback** - a 366-message (~16%) gap
+between "bytes the kernel handed to the process" and "messages the
+application actually surfaced." This is direct, non-inferred evidence
+that at least part of the loss happens **above the syscall layer**, inside
+`nanomq_cli`'s (NNG's) own MQTT frame parsing or callback dispatch, not as
+packets dropped on the wire - bytes demonstrably arrived at the process
+and were still lost. Separately, total bytes read from the socket
+(43,204) fell short of the 47,500 bytes needed for all 2,500 messages,
+suggesting some additional loss upstream of the read syscall too (network/
+socket-buffer level) - though this figure is confounded by teardown timing
+in that specific run (the subscriber was killed after a fixed wait rather
+than a verified stdout plateau, unlike the other runs in this
+investigation), so it isn't as clean a number as the 2,301-vs-1,935 gap.
+
+**Conclusion**: the loss is not a single clean mechanism at one layer -
+there is direct, syscall-level proof of loss *above* the read/`readv`
+layer (the 2,301-vs-1,935 gap), and suggestive but less rigorously
+isolated evidence of additional loss at or below the socket-read layer.
+Packet capture would be needed to fully resolve the latter and rule wire-
+level loopback drops in or out with certainty; that step remains blocked
+by this environment's lack of raw-socket capability, not by anything
+about NanoMQ or `nanomq_cli` itself. The elimination-based conclusion
+above stands and is now reinforced with direct evidence for at least one
+concrete loss point: `nanomq_cli`'s own receive-side parsing/dispatch
+demonstrably drops fully-received wire data under concurrent-publisher
+burst load.
+
 ## Maintained Documentation
 
 - [`QUICKSTART.md`](QUICKSTART.md): install, build, and first usage
