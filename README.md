@@ -417,6 +417,77 @@ an oversight - the honest answer is "we tried the approved tool, it isn't
 fit for this specific job at this scale," not a number pretending
 otherwise.
 
+### Follow-up: root-causing the QoS-0 loss above
+
+The 57% loss (1,067/2,500 messages, 5 concurrent `nanomq_cli pub` processes
+into one `nanomq_cli sub`) was investigated directly rather than left as a
+guess. Six independent variants were run, each isolating one candidate
+cause, all against a fresh broker per run:
+
+1. **Subscribe-before-publish race** (the most likely mundane explanation,
+   given this exact class of bug has shown up repeatedly elsewhere this
+   session - BlazingMQ's non-retroactive filtering, a real `bmq_subscribe`
+   race fixed earlier, `nats_sidecar`'s DSM readiness handshake): confirmed
+   the subscriber's `CONNECT`/`SUBACK` completed (via `-v` log output), then
+   waited a further 3 seconds - a generous head start - before starting any
+   publisher. **Result: 1,064/2,500 received, statistically identical to
+   the original run. Ruled out.**
+2. **Client-ID collision** (default `nanomq_cli` client IDs are randomly
+   generated per-process; if two of five processes launched in the same
+   instant collided, MQTT requires the broker to disconnect the earlier
+   client, truncating its stream): re-ran with explicit, guaranteed-unique
+   `-i` identifiers per publisher. **Result: 1,064/2,500. Ruled out.**
+3. **Publisher-side send failures**: every one of the five publisher logs
+   showed a clean `connect_cb: ... result: 0` and `disconnected reason: 0`
+   (normal, self-initiated disconnect after finishing) with zero errors -
+   from the publisher's own point of view, all 500 messages per process
+   were sent successfully every time. Loss is not happening on the publish
+   side.
+4. **Which publishers lose messages**: tagged each publisher's payload with
+   its own identity and counted per-publisher arrivals. All five
+   contributed a non-zero, non-500 share (170-278 out of 500 each, summing
+   to 1,064) - loss is spread proportionally across every publisher, not
+   one process failing outright. Consistent with a shared downstream
+   constraint, not a single publisher's bug.
+5. **Broker-side queue capacity** (`mqtt.max_mqueue_len`/
+   `max_inflight_window`, default config ships `2048`, comfortably above
+   2,500 total messages already - though the config actually in effect for
+   a bare `nanomq start` with no `--conf` wasn't confirmed to be that
+   file): started a second broker instance with an explicit config setting
+   both to `100,000` - fifty times more headroom. **Result: 1,064/2,500,
+   the same number again.** A real, sensitive capacity limit would very
+   plausibly respond to a 50x change; getting the identical count instead
+   points away from broker-side buffering as the mechanism.
+6. **Broker log inspection**: the only `WARN`-level lines during any run
+   were generic `nni aio recv error!! Connection shutdown` /
+   `recv_error rv: 139` messages - confirmed benign by running a clean
+   single-publisher/100-message control that received 100/100 with zero
+   loss and produced the *exact same* warning lines. These are routine
+   per-connection teardown logging, not evidence of drops.
+
+**Conclusion: not a test-harness timing bug, not a broker-side capacity
+limit as configured - the evidence points at `nanomq_cli`'s own subscriber
+process (its bundled demo/test client, built on NNG) as the actual limiting
+layer under a concurrent multi-publisher burst**, not something in NanoMQ
+the broker itself. This is inferred from elimination (five other candidate
+causes directly ruled out or shown not to move the number) rather than
+directly proven with a packet capture or client-side instrumentation - a
+stronger proof would trace the exact drop point inside `nanomq_cli`'s own
+receive path, not attempted here. Practically: this means the earlier
+"NanoMQ vs `nats-server`" question is *still* unanswered, and for the same
+underlying reason as before - `nanomq_cli` is a demo/test tool, not
+production load-testing tooling, and this investigation surfaces a second,
+independent way in which that shows up (unreliable receipt under
+concurrent burst, on top of the earlier `-I` rate ceiling).
+
+**Bonus finding, unrelated to the loss investigation itself**: `nanomq_cli
+pub -l` (stdin-line mode, reading one message per line from piped input)
+**segfaults** reliably when driven this way (`cat file | nanomq_cli pub -l
+...`) - a real, reproducible crash in the CLI tool, discovered while trying
+to use sequence-numbered payloads for finer-grained diagnosis. Worth
+avoiding `-l` mode entirely until upstream fixes it; not investigated
+further here since it's off the main thread of this task.
+
 ## Maintained Documentation
 
 - [`QUICKSTART.md`](QUICKSTART.md): install, build, and first usage
