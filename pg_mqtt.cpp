@@ -562,7 +562,16 @@ void mqtt_subscriber_main(Datum main_arg)
         mqtt5::qos_e max_qos = qos == 0 ? mqtt5::qos_e::at_most_once
                               : qos == 1 ? mqtt5::qos_e::at_least_once
                                          : mqtt5::qos_e::exactly_once;
-        mqtt5::subscribe_topic sub_topic{topic, mqtt5::subscribe_options{max_qos}};
+        // Boost.MQTT5 defaults no_local to yes, but the MQTT 5 spec (3.8.3.1)
+        // makes it a Protocol Error to set No Local on a Shared Subscription
+        // ("$share/<group>/<filter>") - NanoMQ correctly rejects it
+        // (observed: "No local is conflict with shared subscription!").
+        // Force it off for shared subscriptions; leave the default alone
+        // otherwise since it's a real, useful option for plain topics.
+        mqtt5::no_local_e no_local = topic.rfind("$share/", 0) == 0
+            ? mqtt5::no_local_e::no : mqtt5::no_local_e::yes;
+        mqtt5::subscribe_topic sub_topic{
+            topic, mqtt5::subscribe_options{max_qos, no_local}};
 
         // Single-threaded worker: this same thread both posts the
         // subscribe request and pumps the io_context, so drive run_one()

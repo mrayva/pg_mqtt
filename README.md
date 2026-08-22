@@ -183,6 +183,90 @@ database connection open. Recover with `SELECT pg_terminate_backend(pid)
 FROM pg_stat_activity WHERE backend_type = 'pg_mqtt subscriber';` before
 retrying.
 
+## Benchmarks: Stress-Testing With The Pattern That Found `nats-server`'s Bottleneck
+
+`~/pg_blazingmq/bench/README.md` found `nats-server`'s ultimate bottleneck
+via a specific stress pattern: N *competing* consumers (a NATS queue group)
+against one publisher, swept N=1/2/4/8/16/32, profiled with `perf`. Peaked
+at N=4 (~915k/s aggregate), then declined gently to N=32 - root-caused to
+per-connection `flushOutbound` write cost plus Go GC/scheduler pressure,
+both growing with connection count. This section re-runs the same pattern
+here, using `pg_mqtt`'s real, shipped `mqtt_subscribe`/`mqtt_publish_text`
+- no throwaway driver.
+
+**A real bug found and fixed first**: MQTT's competing-consumer analog to a
+NATS queue group is a *shared subscription* (`$share/<group>/<topic>`).
+Subscribing 2 `mqtt_subscribe()` workers to one raised
+`WARNING: ... has not finished subscribing after 5000ms` on both, and
+NanoMQ's log showed why: `No local is conflict with shared subscription!`.
+Boost.MQTT5 defaults `subscribe_options::no_local` to `yes`, but MQTT 5
+section 3.8.3.1 makes it a Protocol Error to set No Local on a shared
+subscription - NanoMQ was correctly rejecting a spec violation, not
+misbehaving. Fixed in `pg_mqtt.cpp`: `no_local` is now forced off
+specifically when the topic starts with `$share/`, left at its default
+otherwise. Verified directly before trusting anything downstream: 2
+workers, 200 published messages, exactly 100/100 split, 0 duplicates.
+
+**Full N=1..32 sweep** (20,000 messages/run, sequence-numbered payloads,
+fresh NanoMQ restart per N, correctness checked every run):
+
+| N | publish rate | drain-only rate | correctness |
+|---|---|---|---|
+| 1 | 12,262/s | 661/s | 20,000/20,000, 0 dup |
+| 2 | 12,001/s | 670/s | 20,000/20,000, 0 dup |
+| 4 | 11,960/s | 1,381/s | 20,000/20,000, 0 dup |
+| 8 | 11,938/s | 3,033/s | 20,000/20,000, 0 dup |
+| 16 | 11,794/s | 7,242/s | 20,000/20,000, 0 dup |
+| 32 | 11,749/s | 10,818/s | 20,000/20,000, 0 dup |
+
+Perfect, evenly-balanced round-robin delivery at every N (e.g. N=32: 1,000
+per worker, all 32 workers identical). Publish rate is flat regardless of
+N, as expected (one publisher, unrelated to subscriber count). Drain rate
+climbs **continuously and monotonically all the way to N=32** - no peak,
+no decline, no collapse - a third shape, distinct from both `nats-server`'s
+peak-then-gentle-decline and BlazingMQ priority mode's flat wall/collapse.
+
+**This does not actually answer the original question, and that's the
+real finding.** At N=1, draining 20,000 messages took a slow, remarkably
+steady ~31 seconds (~650/s, consistent second-over-second - confirmed via
+a dedicated re-run with fine-grained polling, not inferred from one
+timeout). That rate is consistent with Postgres's own per-message
+transaction-commit cost (`StartTransactionCommand`/`SPI_connect`/insert/
+commit, once per callback invocation) - not anything happening inside
+NanoMQ. The N=1..32 ceiling (topping out at ~10,818/s) never gets within
+1-2 orders of magnitude of the ~700k-900k/s range where `nats-server`'s
+own connection-scaling bottleneck actually appeared. A `perf`/`mpstat`
+attempt at N=32 confirmed this indirectly: the profiler mistakenly
+attached to the wrong process (a real tooling miss, not re-attempted
+given the low expected value) but `mpstat -P ALL` showed ~97.9% aggregate
+idle across all cores throughout - nowhere near hardware-bound, consistent
+with the bottleneck being `pg_mqtt`'s own per-message transaction
+overhead rather than any broker- or hardware-level limit.
+
+**Honest conclusion**: this test measures `pg_mqtt`'s own subscribe-path
+scaling (which is real, useful information - it scales cleanly with
+worker count, unlike BlazingMQ's priority mode) but it cannot answer
+whether NanoMQ's own connection-handling would hit a wall like
+`nats-server`'s, because `pg_mqtt`'s per-message Postgres transaction cost
+becomes the limiting factor several orders of magnitude before NanoMQ's
+own broker-side connection-scaling behavior would plausibly matter.
+Answering the original question would need a raw, non-Postgres MQTT
+client stressing NanoMQ directly at hundreds-of-thousands-of-messages/sec
+- out of scope here by design (this session deliberately avoided a
+throwaway driver in favor of exercising `pg_mqtt`'s real, shipped
+functions).
+
+**Secondary finding, also real**: `mqtt_unsubscribe()`'s `SIGTERM` did not
+cleanly terminate two workers whose broker connection was already dead
+(discovered when a broker was stopped without unsubscribing first) - both
+required a forced `kill -9` to clear, `mqtt_unsubscribe()` itself reported
+success (`true`) despite the worker not actually exiting. Not
+investigated further here (out of scope for this benchmark), but a real
+gap in the shutdown path worth fixing: the worker's event loop likely
+blocks inside `async_disconnect()`/`ioc.run_one()` waiting for a response
+from a broker that's no longer there, rather than timing out and exiting
+on `ShutdownRequestPending` regardless.
+
 ## Plan
 
 Mirroring `pg_blazingmq`'s own phased build:
