@@ -1027,6 +1027,97 @@ widen further under different `max_queued_messages`/persistence settings on
 either broker; this test answers "is it broker-side" cleanly, not "what's
 each broker's true ceiling under best-effort tuning."
 
+## Follow-Up: A Broader Broker Survey - "Not A Stone Left Unturned"
+
+The Mosquitto isolation test above proved broker choice matters enormously,
+so this follow-up widens the field: same unmodified `mqtt_raw_bench.cpp`
+client, same N=1/8/32 sweep methodology, pointed at four more brokers -
+EMQX, VerneMQ, HiveMQ CE, and RabbitMQ's MQTT plugin - each installed
+alongside the existing NanoMQ/Mosquitto setups on distinct non-default
+ports to avoid any collision with concurrent work in this repo. FlashMQ
+was in scope but skipped: no packaged distribution was found quickly, and
+a source build was judged not worth the time this survey had budgeted,
+consistent with this document's own stated policy of not letting one
+broker consume the whole investigation.
+
+**Two brokers produced clean, comparable numbers:**
+
+| N | NanoMQ | Mosquitto 2.0.22 | VerneMQ 2.2.0 |
+|---|---|---|---|
+| 1  | 8,223/s   | 225,873/s | **151,981/s** |
+| 8  | 17,932/s  | 202,386/s | **63,667/s** |
+| 32 | 22,968/s  | 134,738/s | **52,564/s** |
+
+VerneMQ works out of the box with this client (0% loss at every N) and
+comfortably beats NanoMQ, but trails Mosquitto - roughly 18x NanoMQ at
+N=1 vs. Mosquitto's ~27x, and like Mosquitto (and unlike NanoMQ) its
+throughput *declines* with N rather than rising. **Mosquitto remains the
+clear leader of everything tested so far, at every N measured.**
+
+**Three brokers could not produce a comparable number - each for a
+different, precisely-diagnosed reason, not vague "didn't work":**
+
+- **RabbitMQ (via `rabbitmq_mqtt` plugin) does not support MQTT 5 shared
+  subscriptions at all.** Confirmed directly: a plain-topic subscribe
+  delivers a published message correctly, but a `$share/benchgroup/...`
+  subscribe accepts silently (no protocol error) and then never delivers
+  anything - `mqtt_raw_bench` reported `loss_pct=100.00` because there is
+  nothing to be lost, the subscription was never real. This isn't a bug in
+  RabbitMQ, it's a real, documented scope gap in its MQTT plugin (RabbitMQ
+  is fundamentally an AMQP broker with MQTT bolted on as a protocol
+  adapter, not a purpose-built MQTT implementation) - the N-sweep
+  methodology this document uses is structurally inapplicable to it.
+- **EMQX 5.8.0 rejects this client's connection outright**, and the reason
+  is precisely diagnosed via `strace`, not guessed: `mqtt_raw_bench`
+  sends an empty (zero-length) MQTT Client ID, which NanoMQ, Mosquitto,
+  VerneMQ, and RabbitMQ all accept and auto-assign an identifier for
+  (standard, permitted MQTT 5 behavior per spec section 3.1.3.1), but
+  EMQX's default config rejects with CONNACK reason code `0x85` ("Client
+  Identifier not valid"). Combined with `boost::mqtt5`'s already-documented
+  behavior of retrying `CONNECT` forever on failure (see the auth-hang bug
+  found and fixed earlier in this document), this produces a silent,
+  permanent reconnect loop with zero application-visible output - not a
+  throughput characteristic, a strict client-ID policy default that
+  differs from every other broker tested. A direct Python (`paho-mqtt`)
+  MQTT5 client confirmed EMQX's shared-subscription delivery itself works
+  correctly once a valid Client ID is supplied - this is a client-ID
+  policy mismatch with this specific benchmark tool, not a broker
+  capability gap, and reconfiguring EMQX's client-ID policy (or patching
+  the client) was judged out of scope for a same-day survey.
+- **HiveMQ CE 2024.5 could not sustain real-time shared-subscription
+  delivery under this benchmark's burst pattern**, even on a freshly-wiped
+  data directory (ruling out leftover state from an earlier run as the
+  cause). The live test consistently reported `received=0` while
+  `published` climbed past a million messages in ~1.3s - but a follow-up
+  probe minutes later, on a *separate* fresh connection to the same shared
+  group, found a large flood of the earlier run's payloads still draining
+  out. This points to severe internal queueing/backpressure latency in
+  HiveMQ CE's shared-subscription delivery path under a fast burst,
+  not an outright missing feature (messages *do* eventually arrive) - but
+  it makes this exact burst-then-measure methodology unable to extract a
+  comparable sustained-throughput number from it without broker-side
+  tuning well beyond this survey's scope.
+
+**Revised recommendation**: of everything measured across both broker
+follow-ups, **Mosquitto is the clear winner for this ecosystem's actual
+usage shape** (highest throughput at every N, no compatibility friction
+with the existing `boost::mqtt5` client, already the default as of the
+switch documented above). VerneMQ is a legitimate distant second if
+Mosquitto is ever unavailable for some other reason. EMQX and HiveMQ CE
+are not disqualified as broker choices in general - each has a real,
+specific, fixable friction point with *this particular benchmark client*
+- but neither is a drop-in replacement today without further
+broker-side configuration work this survey didn't attempt. RabbitMQ's MQTT
+support is architecturally too limited (no shared subscriptions) for this
+extension's competing-consumer use case regardless of tuning.
+
+**Standard hygiene**: fresh broker restart before each measured N, `ps`-
+and `ss`-verified clean teardown of every broker process and listening
+port after each step and at the end of the whole survey - no broker
+daemon or non-default port (19001/19021/19031/19041) was left running.
+Nothing about NanoMQ's or Mosquitto's existing system installs/config was
+touched by this survey.
+
 ## Maintained Documentation
 
 - [`QUICKSTART.md`](QUICKSTART.md): install, build, and first usage
