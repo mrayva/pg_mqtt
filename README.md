@@ -366,6 +366,57 @@ for the exact functions each version added. This extension hasn't reached
 (Phase 4's test suite added no new SQL surface, so it didn't bump the
 version.)
 
+## Follow-Up: Trying To Reach `nats-server`-Comparable Rates With `nanomq_cli` Directly
+
+The `mqtt_subscribe`-based benchmark above never got close to `nats-server`'s
+~700k-900k/s bottleneck range - it topped out around 10,818/s at N=32,
+limited by `pg_mqtt`'s own per-message Postgres transaction cost (see
+`bench/README.md` in `pg_blazingmq` for the matching finding that this is a
+*shared*, extension-independent cost - `pgnats`'s `nats_subscribe` lands in
+the same ~600/s range at N=1). This follow-up tried to isolate NanoMQ's own
+connection-scaling behavior by going around Postgres entirely, using
+`nanomq_cli` (NanoMQ's own official pub/sub CLI, already installed) directly
+- no `pg_mqtt`, no custom driver.
+
+**Result: `nanomq_cli` itself cannot reach the rates needed to answer the
+original question, and this is a real, reproducible limitation of the tool,
+not a conclusion about NanoMQ the broker.**
+
+- `nanomq_cli pub`'s `-I <ms>` inter-message interval has a real floor: `-I
+  0` is rejected outright (`Integer argument too small (value > 1)`), so
+  `-I 1` is the fastest available - a hard ~1,000 msg/s ceiling *per
+  connection*, confirmed directly (1,000 messages at `-I 1` took ~2s
+  including connect/disconnect overhead).
+- `-n <parallel>` (multiple connections from one `pub` invocation) did not
+  behave reliably: runs produced `nng_send_aio: Object closed` errors and
+  message loss, not a clean multiplication of throughput.
+- Falling back to genuinely independent OS processes (5 separate
+  `nanomq_cli pub` invocations, 500 messages each at `-I 1`, one shared
+  `nanomq_cli sub` counting arrivals) was more stable but still lost a large
+  fraction of messages at QoS 0 - only 1,067 of 2,500 published messages
+  (~43%) were ever received, stable after the subscriber's full timeout
+  window, at a scale (2,500 messages, 5 concurrent processes) far too small
+  to be an interesting throughput data point on its own.
+
+Given this, scaling up to the hundreds of parallel OS processes that would
+be needed to approach `nats-server`'s ~900k/s peak through this interface
+was not attempted - both because `-I`'s per-connection ceiling makes it
+impractical without an unreasonable process count, and because the
+reliability problems at trivial scale would make any resulting number
+untrustworthy without first understanding *why* messages were being lost
+(a real, separate investigation of its own, out of scope here).
+
+**The original question - does NanoMQ's C implementation avoid the
+`flushOutbound`/GC-driven decline `nats-server` shows past N=4 - remains
+genuinely open.** Answering it properly would need either a purpose-built
+high-throughput MQTT load generator (the kind of tool this investigation
+was explicitly asked not to build as a one-off), or profiling NanoMQ under
+whatever its own real production benchmarking tooling is, if any exists
+upstream. Recorded here as a deliberate, evidence-based stopping point, not
+an oversight - the honest answer is "we tried the approved tool, it isn't
+fit for this specific job at this scale," not a number pretending
+otherwise.
+
 ## Maintained Documentation
 
 - [`QUICKSTART.md`](QUICKSTART.md): install, build, and first usage
