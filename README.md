@@ -325,6 +325,31 @@ cleanly) lands in the same place. Neither extension's push-consume design
 is unusually slow; one Postgres transaction per message just costs what it
 costs.
 
+### Three-Way: Adding `pg_blazingmq`'s `bmq_subscribe`
+
+Completed in `~/pg_blazingmq/bench/README.md` (same repo, that document is
+the natural home for a new `pg_blazingmq` number) - summarized here since
+this is where the comparison narrative lives:
+
+| system | N=1 drain rate |
+|---|---|
+| `pg_mqtt` (`mqtt_subscribe`, NanoMQ) | 661/s |
+| `pgnats` (`nats_subscribe`, NATS core) | 600-611/s |
+| `pg_blazingmq` (`bmq_subscribe`, BlazingMQ broadcast) | 751-976/s (two runs) |
+
+Same order of magnitude as the other two (all three within roughly a 1.6x
+band), broadly confirming the shared-transaction-cost hypothesis - but not
+an exact match, and the direction is worth knowing: `bmq_subscribe` does
+strictly *more* per-message work than either (an explicit
+`session.confirmMessage()` network round-trip after every commit that
+neither `mqtt_subscribe` nor `nats_subscribe` has an equivalent of), yet
+came out faster in both runs, not slower. So the ~600-660/s figure from
+the two-way comparison above isn't a precise universal constant - it's the
+rough floor this whole class of one-transaction-per-callback extension
+design pays, with real headroom for broker-specific round-trip
+characteristics (and ordinary run-to-run variance - `bmq_subscribe`'s own
+two runs spread ~23%, 976/s vs 751/s) to move the exact number around.
+
 ## Plan
 
 Mirroring `pg_blazingmq`'s own phased build:
