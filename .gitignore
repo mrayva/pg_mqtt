@@ -7,3 +7,4 @@ regression.diffs
 regression.out
 log/
 test/.broker_scratch/
+bench/mqtt_raw_bench

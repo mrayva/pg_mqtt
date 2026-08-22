@@ -693,6 +693,129 @@ instrumenting `nni_lmq_put`'s actual queue-depth over time rather than
 just its call sites. Reported honestly as the strongest evidence gathered
 so far, not a fully closed case.
 
+## The Original Question, Finally Answered: Does NanoMQ Share `nats-server`'s Connection-Scaling Bottleneck?
+
+This is the question that started the whole investigation above: raw NATS
+core, under a queue group of N competing consumers, peaked at N=4
+(~915k/s) then declined *gently* through N=32, root-caused via `perf` to
+per-connection `(*client).flushOutbound` growing fastest of any profiled
+symbol (10.37%->16.02% of samples, N=4->N=8) plus `sync.RWMutex`
+contention and Go GC/scheduler pressure. Every previous attempt to test
+the same shape against NanoMQ failed on tooling, not methodology:
+`pg_mqtt`'s own Postgres-transaction overhead caps out around 650-10,818/s
+(nowhere near enough to stress a broker), and `nanomq_cli` was separately,
+conclusively proven unfit for this above (rate-limited publish path,
+unreliable `-n`, and its own receive-path message loss under load).
+
+**Built a new, standalone, non-Postgres, non-`nanomq_cli` tool** -
+`bench/mqtt_raw_bench.cpp` - using `boost::mqtt5` directly (the same
+client library `pg_mqtt.cpp` already uses, just without its
+promise/future-blocking sync bridge, which is built for one-call-at-a-time
+Postgres-backend correctness, not firehose throughput). Publishers
+fire-and-forget QoS 0 `async_publish` in self-chaining pipelined loops (16
+lanes x 4 connections); subscribers are N independent connections, each
+subscribed to `$share/benchgroup/<topic>` (MQTT 5 shared subscription -
+the direct analog of a NATS queue group, competing not fan-out consumption
+- reusing the same `no_local`-off-for-`$share/` fix `mqtt_subscribe`
+needed, commit `feade9b`, or NanoMQ rejects the subscribe outright).
+
+**A real methodology trap caught along the way**: the naive
+`published/wall_publish_time` calculation is bogus here - `async_publish`'s
+completion fires on local write-buffer handoff, not broker delivery, so a
+burst of ~200-400k messages completes locally in well under a second
+regardless of `duration_sec`, then the publisher-side counter simply
+freezes while the real work (the broker actually delivering the backlog to
+subscribers) continues for many seconds after. This is the same
+undrained-backlog trap flagged in `project_blazingmq_nats_benchmark.md`'s
+methodology lesson 0, just showing up on the publish side instead of the
+consume side this time. Fixed by sampling `received` every 200-500ms
+through the whole run and only trusting a number once the receive count
+stops climbing across 3 consecutive samples (loss_pct settled at ~0.00-0.02%
+on every N below, i.e. every run fully drained, not cut off mid-backlog).
+
+**N-sweep result** (fixed ~211-215k message backlog per run, fresh NanoMQ
+broker restart before each N, `~/nanomq/build/nanomq/nanomq`, unstripped
+debug build from the `gdb` investigation above):
+
+| N (competing subscribers) | aggregate consume rate |
+|---|---|
+| 1  | 8,223/s |
+| 2  | 10,147/s |
+| 4  | 13,185/s |
+| 8  | 17,932/s |
+| 16 | 22,046/s |
+| 32 | 22,968/s |
+
+**Shape: a smooth, diminishing-returns plateau - not NATS's peak-at-N=4-
+then-gentle-decline.** NanoMQ's aggregate rate keeps rising (never
+declines) through the whole sweep, but with sharply diminishing marginal
+returns past N=8 (16->32 only gained +4%). One immediately-visible reason
+a single subscriber connection caps out as low as ~8,200/s at all: each
+subscriber here runs one serialized `async_receive()`-then-process loop -
+architecturally the *same* single-context receive-loop shape `gdb` already
+found bottlenecking `nanomq_cli`'s own subscriber above, just with a much
+higher individual ceiling since this tool's receive loop does no other
+work per message.
+
+**`perf`-profiled the broker itself at N=4 and N=32** (this succeeded
+cleanly, once `perf record`'s output file was redirected to `$HOME`
+instead of `/tmp` - writing to `/tmp` as root via `sudo -n perf record`
+failed with `Permission denied` even though the parent NanoMQ process's
+own working files live there without issue; a real, narrower version of
+the container restriction that blocked `tshark` entirely earlier in this
+investigation, but unlike that one, this had a working escape hatch).
+Top self-time symbols, both runs:
+
+| symbol | N=4 | N=32 |
+|---|---|---|
+| `pthread_mutex_lock` | 3.12% | 3.98% |
+| `pthread_mutex_unlock` | 2.49% | 3.37% |
+| `__GI___lll_lock_wait` (futex contention) | 1.35% | 1.19% |
+| **combined** | **6.96%** | **8.54%** |
+
+Call graphs show these firing from both the receive path
+(`tcptran_pipe_recv_cb`/`nano_pipe_recv_cb`) and the send/dispatch path
+(`nano_ctx_send`/`tcptran_pipe_send`) - i.e. a real, present, growing-with-N
+mutex-contention cost, structurally the same *kind* of thing as
+`nats-server`'s `flushOutbound`+`RWMutex` finding (per-connection
+socket-path locking that gets more expensive as connection count grows).
+**But it grows far more gently**: ~23% relative growth (6.96%->8.54%) here
+vs. NATS's ~55% relative growth in `flushOutbound` alone (10.37%->16.02%)
+over a comparable N range, before even counting NATS's separate Go
+GC/scheduler cost (~9.3%->12.7%) - a cost category NanoMQ structurally
+cannot have at all, being C. This difference in growth rate is consistent
+with (though this session did not further isolate it down to a single
+line of NanoMQ/NNG source) the difference in observed shape: gentle
+mutex contention growth -> smooth plateau; NATS's steeper combined
+growth (locking *and* GC) -> an actual post-peak decline.
+
+**Answer to the original question**: NanoMQ does *not* share
+`nats-server`'s specific bottleneck mechanism (no Go runtime, no
+`RWMutex`+GC compounding), and its connection-scaling shape is
+measurably more forgiving (plateau vs. decline) - but it is **not**
+free of an analogous *category* of cost either: real, `perf`-confirmed
+pthread mutex contention on the same kind of per-connection send/receive
+code paths, growing with N, just more slowly. "NanoMQ avoids NATS's
+bottleneck" would overstate this; "NanoMQ has a gentler version of the
+same kind of per-connection locking cost, without the GC component" is
+the accurate, evidence-backed claim.
+
+**Caveats, stated plainly**: this test's absolute numbers (max ~23k/s
+aggregate) are far below NATS's ~915k/s peak - not a claim that NanoMQ is
+slower in absolute terms in general, but a reflection of this specific
+tool's per-subscriber-connection design (one `async_receive()` loop per
+connection, matching this session's available client library rather than
+a purpose-built high-throughput NanoMQ benchmark harness) and a
+deliberately-sized ~211-215k backlog per run chosen to keep total sweep
+time reasonable, not the broker's own ceiling. The `perf` percentages
+are relative sample shares within each run, not a controlled A/B on
+otherwise-identical workloads (N=4's run lasted ~16s / 155k samples,
+N=32's ~7s / 60k samples) - real signal, not a fully isolated
+`nats-server`-style differential profile. Reproduce via
+`bench/run_sweep.sh` (the N-sweep) and `bench/run_perf.sh` (the
+`perf`-profiled N=32 run; requires `sudo -n perf record` and a
+`$HOME`-not-`/tmp` output path, per the finding above).
+
 ## Maintained Documentation
 
 - [`QUICKSTART.md`](QUICKSTART.md): install, build, and first usage
